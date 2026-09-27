@@ -7,6 +7,8 @@ import type {
   SnatResult,
   SnatTraceGroup,
 } from './audit/snat'
+import { evaluateSnatCollision } from './audit/snatcollision'
+import type { SnatCollisionResult } from './audit/snatcollision'
 import { TANDEM_CATEGORY_ORDER } from './audit/tandem'
 import type { TandemCategory, TandemRuleRef } from './audit/tandem'
 import { parseRulesJson, validateRules } from './audit/engine'
@@ -295,6 +297,114 @@ function SnatResultView({ result }: { result: SnatResult }) {
   )
 }
 
+/** 转换后源身份碰撞分析结果（只读；只依赖前级放行、源地址映射与目标，不使用后级规则） */
+function SnatCollisionView({ result }: { result: SnatCollisionResult }) {
+  const mappingText = (i: number) =>
+    `#${i + 1} ${result.mappings[i].sourceText} → ${result.mappings[i].translatedText}`
+  return (
+    <div className="snapshot-report" style={{ marginTop: 22 }}>
+      <h3 className="reorder-section-title" style={{ marginTop: 0 }}>
+        转换后源身份碰撞（只读 · 独立于后级规则）
+      </h3>
+      <div className="legend" style={{ marginTop: 0, marginBottom: 10 }}>
+        仅目标内<strong>经前级首命中放行</strong>的报文参与（{formatSize(result.releasedSize)}{' '}
+        条报文空间，{result.releasedCells} 个原子单元；前级未命中、动作不在放行列表、
+        非法与停用规则的处理与上方路径分析完全一致）。每条等长映射把放行的原始
+        IPv4×端口×协议区域投影到转换后空间后逐对求交：同一条转换后报文被两条映射的
+        放行报文同时占用即碰撞。转换后网段重叠但实际放行区域投影不交时不报碰撞；
+        多对重叠时总量按转换后报文去重。本分析不读取后级规则与后级放行动作。
+      </div>
+
+      {result.pairs.length === 0 ? (
+        <div className="notice ok">
+          ✓ 无转换后源身份碰撞：没有任何转换后报文被两条映射的放行报文同时占用。
+        </div>
+      ) : (
+        <>
+          <div className="notice error">
+            ✗ 发现 {result.pairs.length} 对映射发生转换后源身份碰撞：按转换后报文去重共{' '}
+            {formatSize(result.totalSize)} 条报文空间（{result.totalCells} 个原子单元）。
+          </div>
+
+          <div className="stats">
+            <div className="stat-card danger">
+              <div className="label">碰撞映射对</div>
+              <div className="value">{result.pairs.length}</div>
+            </div>
+            <div className="stat-card danger">
+              <div className="label">碰撞总量（转换后报文去重）</div>
+              <div className="value" style={{ fontSize: 16 }}>
+                {formatSize(result.totalSize)}
+              </div>
+            </div>
+            <div className="stat-card">
+              <div className="label">参与计算的放行空间</div>
+              <div className="value" style={{ fontSize: 16 }}>
+                {formatSize(result.releasedSize)}
+              </div>
+            </div>
+          </div>
+
+          <div className="goal-block-title">
+            整体碰撞区域（全部碰撞映射对合并，按转换后报文去重；转换后地址空间）
+          </div>
+          <RegionView regions={result.regions} />
+
+          <div className="goal-block-title">
+            逐对碰撞明细（共 {result.pairs.length} 对，按碰撞空间降序）
+          </div>
+          {result.pairs.map((pair) => (
+            <div className="takeover-block conflict-block" key={`${pair.a}.${pair.b}`}>
+              <div className="takeover-head">
+                <span className="badge fully-shadowed">碰撞</span>
+                <span className="mono">{mappingText(pair.a)}</span>
+                <span className="reorder-arrow">×</span>
+                <span className="mono">{mappingText(pair.b)}</span>
+                <span className="spacer" />
+                <span className="muted-text">
+                  {formatSize(pair.size)} 条转换后报文空间（{pair.cells} 个原子单元）
+                </span>
+              </div>
+              <div className="packet-box">
+                <span className="tag shadowed">见证报文 A</span>
+                <span className="mono">{snatPacketText(pair.witness.packetA)}</span>
+                <span className="arrow-note">经映射 #{pair.a + 1} 转换</span>
+                <CopyButton text={snatPacketText(pair.witness.packetA)} />
+              </div>
+              <div className="packet-box">
+                <span className="tag shadowed">见证报文 B</span>
+                <span className="mono">{snatPacketText(pair.witness.packetB)}</span>
+                <span className="arrow-note">经映射 #{pair.b + 1} 转换</span>
+                <CopyButton text={snatPacketText(pair.witness.packetB)} />
+              </div>
+              <div className="packet-box">
+                <span className="tag shadowed">同一转换后报文</span>
+                <span className="mono">{formatPacket(pair.witness.translated)}</span>
+                <span className="arrow-note">两条不同原始报文转换后无法区分</span>
+                <CopyButton text={formatPacket(pair.witness.translated)} />
+              </div>
+              <div className="goal-block-title">精确转换后碰撞区域</div>
+              <RegionView regions={pair.regions} />
+            </div>
+          ))}
+        </>
+      )}
+
+      {result.nonCollidingOverlaps.length > 0 && (
+        <div className="notice info" style={{ marginTop: 10 }}>
+          以下 {result.nonCollidingOverlaps.length} 对映射的转换后网段虽重叠，
+          但实际放行区域的投影不相交（地址段 / 端口 / 协议不交），不报碰撞：
+          {result.nonCollidingOverlaps.map(({ a, b }) => (
+            <div key={`${a}.${b}`} className="mono" style={{ paddingLeft: 12 }}>
+              {mappingText(a)}　×　{mappingText(b)}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
 export function SnatPanel({ rules }: Props) {
   const [stage2Json, setStage2Json] = useState('')
   const [allow1Text, setAllow1Text] = useState('allow')
@@ -319,6 +429,13 @@ export function SnatPanel({ rules }: Props) {
   // 只读分析：纯函数计算，不改动任何规则；当前规则编辑 / 调序确认后自动重算
   const outcome = useMemo(
     () => (submitted ? evaluateSnat(rules, submitted) : null),
+    [rules, submitted],
+  )
+
+  // 转换后源身份碰撞：只复用前级放行动作、源地址映射与目标，独立于后级规则；
+  // 因此即使后级 JSON / 后级放行动作有误，只要其所需输入合法仍可单独给出结果
+  const collisionOutcome = useMemo(
+    () => (submitted ? evaluateSnatCollision(rules, submitted) : null),
     [rules, submitted],
   )
 
@@ -368,7 +485,8 @@ export function SnatPanel({ rules }: Props) {
         <span className="legend" style={{ marginLeft: 12 }}>
           当前规则为前级（按原始地址首命中），粘贴后级规则 JSON；仅前级放行的报文
           按源地址映射（主机位一一对应）转换后进入后级；目标必须完全落在映射源网段内；
-          不修改任何规则
+          不修改任何规则。结果下方附「转换后源身份碰撞」分析（复用前级放行、映射与目标，
+          独立于后级规则）：逐对检查两条映射的放行报文是否投影到同一条转换后报文。
         </span>
       </div>
 
@@ -500,11 +618,14 @@ export function SnatPanel({ rules }: Props) {
         <div className="notice info" style={{ marginBottom: 0 }}>
           粘贴后级规则 JSON、填写两级放行动作列表、源地址映射与目标空间后点击「执行分析」。
           后级 CIDR 边界将逆映射回原始空间，与目标和前级边界合并切分后逐单元重放；
-          协议 ANY 将分别检查 TCP 与 UDP。
+          协议 ANY 将分别检查 TCP 与 UDP。下方同时给出「转换后源身份碰撞」分析：
+          只使用前级放行动作、源地址映射与目标（与后级规则无关），
+          逐对检查两条映射的放行报文是否会投影到同一条转换后报文。
         </div>
       )}
 
       {outcome?.ok && <SnatResultView result={outcome.result} />}
+      {collisionOutcome?.ok && <SnatCollisionView result={collisionOutcome.result} />}
     </div>
   )
 }
